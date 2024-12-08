@@ -1,0 +1,157 @@
+import RPi.GPIO as GPIO
+import time
+import threading
+
+import socket
+from common import Message, MessageType, SendType, CENTRAL_SERVER_IP, CENTRAL_SERVER_PORT
+from socket_util import create_and_connect_socket
+
+button_pin = 15
+sensor_pin_1 = 4
+sensor_pin_2 = 17
+sensor_pin_3 = 27
+
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(sensor_pin_1, GPIO.IN)
+GPIO.setup(sensor_pin_2, GPIO.IN)
+GPIO.setup(sensor_pin_3, GPIO.IN)
+
+GPIO.setwarnings(False)
+GPIO.setup(button_pin, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
+
+button_state = False
+
+sensor_threads_active = False
+
+
+def handle_sensor_17(stop_event):
+    while not stop_event.is_set():
+        input_17 = GPIO.input(17)
+        if input_17 == 1:
+            print("sensor 17 : Under Pressure")
+        time.sleep(5)
+
+def handle_sensor_4(stop_event):
+    while not stop_event.is_set():
+        input_4 = GPIO.input(4)
+        if input_4 == 1:
+            print("sensor 4 : Under Pressure")
+        time.sleep(5)
+
+def handle_sensor_27(stop_event):
+    while not stop_event.is_set():
+        input_27 = GPIO.input(27)
+        if input_27 == 1:
+            print("sensor 27 : Under Pressure")
+        time.sleep(5)
+
+def button_callback(channel):
+    global button_state, sensor_threads_active, threads, stop_events
+    print("Button pushed")
+    button_state = not button_state
+
+    if button_state and not sensor_threads_active:
+        print("Button ON - comple")
+        # thread on
+        stop_events = [threading.Event() for _ in range(3)]
+        threads = [
+            threading.Thread(target=handle_sensor_17, args=(stop_events[0],)),
+            threading.Thread(target=handle_sensor_4, args=(stop_events[1],)),
+            threading.Thread(target=handle_sensor_27, args=(stop_events[2],))
+        ]
+        for thread in threads:
+            thread.start()
+        sensor_threads_active = True
+    elif not button_state and sensor_threads_active:
+        print("Button OFF")
+        # thread off
+        for event in stop_events:
+            event.set()
+        for thread in threads:
+            thread.join()
+        sensor_threads_active = False
+
+
+
+
+def get_sensor_data(zone):
+    if zone == "A":
+        return GPIO.input(4)
+    if zone == "B":
+        return GPIO.input(17)
+    if zone == "C":
+        return GPIO.input(27)
+
+def get_manual_data(zone):
+    if zone == "A":
+        return 1
+    if zone == "B":
+        return 0
+    if zone == "C":
+        return 0
+    
+def update_inventory(server_socket, zone, updated_inventory):
+    """Send inventory data updates for a specific zone to the server."""
+    msg = Message(
+        type=MessageType.INVENTORY_UPDATE_FROM_WARE,
+        send_type=SendType.SEND_FROM_WAREHOUSE,
+        content=f"{zone}zone: {updated_inventory}",
+    )
+    server_socket.send(msg.serialize())
+    print(f"{zone} zone inventory update completed")
+
+def compare_inventory_and_notify(server_socket, zone):
+    """Compare sensor and manual data for a specific zone, update the inventory with the smaller value, and send instructions."""
+    sensor_data = get_sensor_data(zone)
+    manual_data = get_manual_data(zone)
+
+    if sensor_data != manual_data:
+        updated_inventory = min(sensor_data, manual_data)
+        update_inventory(server_socket, zone, updated_inventory)
+
+        message_content = (
+            f"{zone} zone inventory mismatch"
+        )
+        msg = Message(
+            type=MessageType.WORK_ORDER,
+            send_type=SendType.SEND_FROM_WAREHOUSE,
+            content=message_content,
+        )
+        server_socket.send(msg.serialize())
+        print(f"Work instruction transmission complete")
+    else:
+        print(f"{zone} zone inventory data matches. No further action required.")
+
+if __name__ == "__main__":
+    server_socket = create_and_connect_socket(CENTRAL_SERVER_IP, CENTRAL_SERVER_PORT)
+   
+    previous_sensor_data = {"A": 0, "B": 0, "C": 0}
+    previous_manual_data = {"A": 0, "B": 0, "C": 0}
+    
+    GPIO.add_event_detect(button_pin, GPIO.RISING, callback=button_callback, bouncetime=300)
+
+    try:
+        while True:
+            while button_state == True:
+                for zone in ["A", "B", "C"]:
+                    sensor_data = get_sensor_data(zone)
+                    manual_data = get_manual_data(zone)
+                
+                    #test
+                    print ("sensor: ", zone, ")", sensor_data)
+                    print ("manual: ", zone, ")", manual_data, "\n")
+
+                    if (sensor_data != manual_data):
+                        compare_inventory_and_notify(server_socket, zone)
+                    
+                        #test
+                        print("Dif")
+
+                time.sleep(5)
+
+    except KeyboardInterrupt:
+        print("Program termination request.")
+    except Exception as e:
+        print(f"An error occurred: {e}")
+    finally:
+        server_socket.close()
